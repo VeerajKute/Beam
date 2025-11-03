@@ -214,14 +214,14 @@ python -m site --user-base
 
 This will output a path like:
 ```
-C:\Users\VEERAJ\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.10_qbz5n2kfra8p0\LocalCache\local-packages\Python310
+C:\Users\<user>\AppData\Local\Packages\..\local-packages\Python310
 ```
 
 **Step 2: Add `\Scripts` to the path**
 
 Copy that path and add `\Scripts` at the end:
 ```
-C:\Users\VEERAJ\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.10_qbz5n2kfra8p0\LocalCache\local-packages\Python310\Scripts
+C:\Users\<user>\AppData\..\Python310\Scripts
 ```
 
 **Step 3: Add to PATH**

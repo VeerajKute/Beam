@@ -91,7 +91,8 @@ class NetworkDiscovery:
                     if self.socket:
                         data, addr = self.socket.recvfrom(1024)
                         response = data.decode()
-                        if message in response:
+                        # Only accept explicit receiver responses
+                        if "RECEIVER_READY" in response:
                             discovered.append((addr[0], response))
                 except socket.timeout:
                     continue
