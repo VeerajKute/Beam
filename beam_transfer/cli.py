@@ -17,6 +17,7 @@ def cmd_send(args):
     """Handle send command."""
     filepath = args.file
     transfer_key = args.key
+    target_ip = getattr(args, 'ip', None)
     
     # Validate file exists
     if not Path(filepath).exists():
@@ -29,7 +30,11 @@ def cmd_send(args):
     
     # Send file
     sender = FileSender(filepath, transfer_key)
-    success = sender.transfer()
+    if target_ip:
+        # Direct send to provided IP, skip discovery
+        success = sender.send_file(target_ip)
+    else:
+        success = sender.transfer()
     
     sys.exit(0 if success else 1)
 
@@ -74,6 +79,7 @@ def main():
     send_parser = subparsers.add_parser('send', help='Send a file')
     send_parser.add_argument('file', help='File to send')
     send_parser.add_argument('-k', '--key', help='Transfer key (auto-generated if not provided)')
+    send_parser.add_argument('--ip', help='Receiver IP address (skip discovery and send directly)')
     send_parser.set_defaults(func=cmd_send)
     
     # Receive command

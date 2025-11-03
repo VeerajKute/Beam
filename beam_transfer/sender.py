@@ -31,13 +31,35 @@ class FileSender:
         message = f"SENDER_REQUEST:{self.filename}:{self.file_size}:{self.transfer_key}"
         devices = discovery.discover_devices(message)
 
-        # Prefer non-local receivers; ignore self if discovered
+        # Prefer non-local receivers; ignore any of our local addresses if discovered
         if devices:
-            non_local = [d for d in devices if d[0] not in {discovery.local_ip, "127.0.0.1"}]
+            local_ips = self._get_local_ipv4_addresses()
+            local_ips.update({discovery.local_ip, "127.0.0.1"})
+            non_local = [d for d in devices if d[0] not in local_ips]
             if non_local:
                 return non_local[0]
             return devices[0]  # fallback to first (e.g., single-machine transfer)
         return None
+
+    def _get_local_ipv4_addresses(self) -> set:
+        """Return a set of local IPv4 addresses for this host."""
+        addresses = {"127.0.0.1"}
+        try:
+            hostname = socket.gethostname()
+            # gethostbyname_ex returns (hostname, aliaslist, ipaddrlist)
+            _, _, ip_list = socket.gethostbyname_ex(hostname)
+            addresses.update(ip_list)
+        except Exception:
+            pass
+        # Best-effort: probe typical local endpoint to infer primary IP
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            addresses.add(s.getsockname()[0])
+            s.close()
+        except Exception:
+            pass
+        return {ip for ip in addresses if ":" not in ip}
     
     def send_file(self, receiver_ip: str) -> bool:
         """Send file to receiver."""
