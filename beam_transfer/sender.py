@@ -8,7 +8,7 @@ import struct
 import sys
 from typing import Optional
 from beam_transfer.network import NetworkDiscovery, ConnectionHandler
-from beam_transfer.security import generate_transfer_key, get_key_hash, AESEncryptor
+from beam_transfer.security import generate_transfer_key, get_key_hash, AESEncryptor, AESCTREncryptor
 from beam_transfer.utils import safe_print
 from tqdm import tqdm
 
@@ -81,12 +81,15 @@ class FileSender:
             try:
                 # Send header: filename, file size, and key hash
                 key_hash = get_key_hash(self.transfer_key)
+                # Generate a single IV for the whole session (16 bytes)
+                session_iv = os.urandom(16)
                 header = struct.pack(
-                    f"!I{len(self.filename.encode())}sQ{len(key_hash)}s",
+                    f"!I{len(self.filename.encode())}sQ{len(key_hash)}s16s",
                     len(self.filename.encode()),
                     self.filename.encode(),
                     self.file_size,
-                    key_hash
+                    key_hash,
+                    session_iv
                 )
                 sock.sendall(header)
                 
@@ -96,8 +99,8 @@ class FileSender:
                     print("Receiver declined the transfer.")
                     return False
                 
-                # Initialize encryption
-                self.cipher = AESEncryptor(key_hash)
+                # Initialize streaming encryption (CTR) with the session IV
+                stream_cipher = AESCTREncryptor(key_hash, session_iv, is_encryptor=True)
                 print(f"Sending file: {self.filename} ({self._format_size(self.file_size)})")
                 print("-" * 60)
                 
@@ -110,8 +113,8 @@ class FileSender:
                             if not chunk:
                                 break
                             
-                            # Encrypt chunk
-                            encrypted_chunk = self.cipher.encrypt(chunk)
+                            # Encrypt chunk (streaming, no padding, no per-chunk IV)
+                            encrypted_chunk = stream_cipher.update(chunk)
                             
                             # Send encrypted chunk with size prefix
                             chunk_header = struct.pack('!I', len(encrypted_chunk))
@@ -123,6 +126,8 @@ class FileSender:
                             pbar.update(len(chunk))
                 
                 # Wait for final confirmation
+                # Finalize stream (CTR finalize returns empty, but call for completeness)
+                _ = stream_cipher.finalize()
                 final_response = sock.recv(1)
                 if final_response == b'Y':
                     safe_print("\n[OK] File sent successfully!")

@@ -68,3 +68,18 @@ class AESEncryptor:
         
         return plaintext
 
+
+class AESCTREncryptor:
+    """Streaming AES-CTR encryptor/decryptor (no padding, single IV per session)."""
+    def __init__(self, key: bytes, iv: bytes, is_encryptor: bool):
+        self.key = key
+        self.iv = iv
+        cipher = Cipher(algorithms.AES(self.key), modes.CTR(self.iv))
+        # Maintain a streaming context to avoid re-initialization overhead
+        self._ctx = cipher.encryptor() if is_encryptor else cipher.decryptor()
+
+    def update(self, data: bytes) -> bytes:
+        return self._ctx.update(data)
+
+    def finalize(self) -> bytes:
+        return self._ctx.finalize()

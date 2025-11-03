@@ -8,7 +8,7 @@ import struct
 import threading
 from typing import Optional
 from beam_transfer.network import NetworkDiscovery, ConnectionHandler, BROADCAST_PORT, FILE_TRANSFER_PORT
-from beam_transfer.security import get_key_hash, AESEncryptor
+from beam_transfer.security import get_key_hash, AESEncryptor, AESCTREncryptor
 from beam_transfer.utils import safe_print
 
 
@@ -82,10 +82,13 @@ class FileReceiver:
                 return
             file_size = struct.unpack('!Q', file_size_data)[0]
             
-            # Receive key hash
+            # Receive key hash and session IV (CTR)
             key_hash_len = 32  # SHA-256 = 32 bytes
             key_hash_data = sock.recv(key_hash_len)
             if len(key_hash_data) != key_hash_len:
+                return
+            session_iv = sock.recv(16)
+            if len(session_iv) != 16:
                 return
             
             # Prompt user for acceptance
@@ -113,7 +116,7 @@ class FileReceiver:
                 sock.sendall(b'Y')
                 
                 # Receive and save file
-                self._receive_file(sock, filename, file_size, key_hash_data)
+                self._receive_file(sock, filename, file_size, key_hash_data, session_iv)
                 
                 # Send final confirmation
                 sock.sendall(b'Y')
@@ -127,14 +130,14 @@ class FileReceiver:
         finally:
             sock.close()
     
-    def _receive_file(self, sock: socket.socket, filename: str, file_size: int, key_hash: bytes) -> None:
+    def _receive_file(self, sock: socket.socket, filename: str, file_size: int, key_hash: bytes, session_iv: bytes) -> None:
         """Receive and decrypt file."""
         # Ensure download directory exists
         os.makedirs(self.download_dir, exist_ok=True)
         filepath = os.path.join(self.download_dir, filename)
         
-        # Initialize decryption
-        cipher = AESEncryptor(key_hash)
+        # Initialize streaming decryption (CTR) with the session IV
+        cipher = AESCTREncryptor(key_hash, session_iv, is_encryptor=False)
         
         # Receive and decrypt file
         received_bytes = 0
@@ -165,7 +168,7 @@ class FileReceiver:
                     
                     # Decrypt chunk
                     try:
-                        decrypted_chunk = cipher.decrypt(encrypted_chunk)
+                        decrypted_chunk = cipher.update(encrypted_chunk)
                         f.write(decrypted_chunk)
                         received_bytes += len(decrypted_chunk)
                         pbar.update(len(decrypted_chunk))
