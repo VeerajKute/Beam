@@ -65,6 +65,8 @@ class FileSender:
         """Send file to receiver."""
         try:
             print(f"Connecting to receiver at {receiver_ip}...")
+            # Show the transfer key BEFORE the receiver asks for it
+            print(f"Transfer Key: {self.transfer_key}")
             
             # Connect to receiver
             sock = ConnectionHandler.create_client_socket()
@@ -90,9 +92,7 @@ class FileSender:
                 
                 # Initialize encryption
                 self.cipher = AESEncryptor(key_hash)
-                
                 print(f"Sending file: {self.filename} ({self._format_size(self.file_size)})")
-                print(f"Transfer Key: {self.transfer_key}")
                 print("-" * 60)
                 
                 # Send file in chunks
