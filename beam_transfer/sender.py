@@ -30,9 +30,13 @@ class FileSender:
         discovery = NetworkDiscovery()
         message = f"SENDER_REQUEST:{self.filename}:{self.file_size}:{self.transfer_key}"
         devices = discovery.discover_devices(message)
-        
+
+        # Prefer non-local receivers; ignore self if discovered
         if devices:
-            return devices[0]  # Return first available receiver
+            non_local = [d for d in devices if d[0] not in {discovery.local_ip, "127.0.0.1"}]
+            if non_local:
+                return non_local[0]
+            return devices[0]  # fallback to first (e.g., single-machine transfer)
         return None
     
     def send_file(self, receiver_ip: str) -> bool:
