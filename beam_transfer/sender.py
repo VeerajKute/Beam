@@ -22,7 +22,8 @@ class FileSender:
         self.filename = os.path.basename(filepath)
         self.file_size = os.path.getsize(filepath)
         self.transfer_key = transfer_key or generate_transfer_key()
-        self.chunk_size = 64 * 1024  # 64KB chunks
+        # Use large chunks to reduce per-chunk overhead and increase throughput
+        self.chunk_size = 4 * 1024 * 1024  # 4MB chunks
         self.cipher = None
         
     def find_receiver(self) -> Optional[tuple]:
@@ -70,6 +71,11 @@ class FileSender:
             
             # Connect to receiver
             sock = ConnectionHandler.create_client_socket()
+            try:
+                # Increase socket send buffer for higher throughput
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+            except Exception:
+                pass
             sock.connect((receiver_ip, 25001))
             
             try:
@@ -110,7 +116,8 @@ class FileSender:
                             # Send encrypted chunk with size prefix
                             chunk_header = struct.pack('!I', len(encrypted_chunk))
                             sock.sendall(chunk_header)
-                            sock.sendall(encrypted_chunk)
+                            # Use memoryview to avoid extra copies in Python
+                            sock.sendall(memoryview(encrypted_chunk))
                             
                             sent_bytes += len(chunk)
                             pbar.update(len(chunk))

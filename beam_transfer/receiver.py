@@ -18,7 +18,8 @@ class FileReceiver:
     def __init__(self, download_dir: str = "."):
         """Initialize file receiver."""
         self.download_dir = download_dir
-        self.chunk_size = 64 * 1024  # 64KB chunks
+        # Use larger internal read size; actual encrypted chunk size is prefixed by sender
+        self.chunk_size = 4 * 1024 * 1024  # 4MB
         self.running = False
         self.server_socket = None
         
@@ -37,6 +38,11 @@ class FileReceiver:
             while self.running:
                 try:
                     client_socket, client_address = self.server_socket.accept()
+                    try:
+                        # Increase socket receive buffer to improve throughput
+                        client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+                    except Exception:
+                        pass
                     
                     # Handle each transfer in a separate thread
                     thread = threading.Thread(
@@ -144,19 +150,22 @@ class FileReceiver:
                     encrypted_chunk_size = struct.unpack('!I', chunk_size_data)[0]
                     
                     # Receive encrypted chunk
-                    encrypted_chunk = bytearray()
-                    while len(encrypted_chunk) < encrypted_chunk_size:
-                        chunk = sock.recv(min(encrypted_chunk_size - len(encrypted_chunk), self.chunk_size))
-                        if not chunk:
+                    # Read encrypted chunk directly into a preallocated buffer
+                    encrypted_chunk = bytearray(encrypted_chunk_size)
+                    view = memoryview(encrypted_chunk)
+                    bytes_read = 0
+                    while bytes_read < encrypted_chunk_size:
+                        n = sock.recv_into(view[bytes_read:], min(encrypted_chunk_size - bytes_read, self.chunk_size))
+                        if not n:
                             break
-                        encrypted_chunk.extend(chunk)
+                        bytes_read += n
                     
-                    if len(encrypted_chunk) != encrypted_chunk_size:
+                    if bytes_read != encrypted_chunk_size:
                         break
                     
                     # Decrypt chunk
                     try:
-                        decrypted_chunk = cipher.decrypt(bytes(encrypted_chunk))
+                        decrypted_chunk = cipher.decrypt(encrypted_chunk)
                         f.write(decrypted_chunk)
                         received_bytes += len(decrypted_chunk)
                         pbar.update(len(decrypted_chunk))
