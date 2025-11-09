@@ -23,7 +23,6 @@ from beam_transfer.network import FILE_TRANSFER_PORT, NetworkDiscovery
 from beam_transfer.security import AESCTREncryptor, generate_transfer_key, get_key_hash
 from beam_transfer.utils import safe_print
 
-
 FLAG_COMPRESS = 0x01
 FLAG_MULTI_STREAM = 0x02
 FLAG_TAR_ARCHIVE = 0x04
@@ -37,12 +36,13 @@ class TransferOptions:
     enable_compression: bool = True
     compression_level: int = 1
     parallel_streams: int = 1
+    fanout: bool = True
 
     def normalized(self) -> "TransferOptions":
         chunk = max(256 * 1024, self.chunk_size)
         level = min(9, max(0, self.compression_level))
         streams = max(1, min(4, self.parallel_streams))
-        return TransferOptions(chunk, self.enable_compression, level, streams)
+        return TransferOptions(chunk, self.enable_compression, level, streams, self.fanout)
 
 
 @dataclass
@@ -50,6 +50,13 @@ class StreamSegment:
     start: int
     length: int
     iv: bytes
+
+
+@dataclass
+class ReceiverConnection:
+    ip: str
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
 
 
 class FileSender:
@@ -65,24 +72,31 @@ class FileSender:
         self.filepath = filepath
         self.filename = os.path.basename(os.path.normpath(filepath))
         self.is_directory = os.path.isdir(filepath)
-        self.file_size = 0 if self.is_directory else os.path.getsize(filepath)
+        if self.is_directory:
+            self.file_size = self._compute_directory_size(filepath)
+        else:
+            self.file_size = os.path.getsize(filepath)
         self.transfer_key = transfer_key or generate_transfer_key()
         self.options = (options or TransferOptions()).normalized()
 
-    def find_receiver(self) -> Optional[tuple]:
+    def find_receivers(self) -> List[tuple]:
         """Discover available receivers on the network."""
         discovery = NetworkDiscovery()
         message = f"SENDER_REQUEST:{self.filename}:{self.file_size}:{self.transfer_key}"
         devices = discovery.discover_devices(message)
 
-        if devices:
-            local_ips = self._get_local_ipv4_addresses()
-            local_ips.update({discovery.local_ip, "127.0.0.1"})
-            non_local = [d for d in devices if d[0] not in local_ips]
-            if non_local:
-                return non_local[0]
-            return devices[0]
-        return None
+        if not devices:
+            return []
+
+        local_ips = self._get_local_ipv4_addresses()
+        local_ips.update({discovery.local_ip, "127.0.0.1"})
+
+        non_local = [d for d in devices if d[0] not in local_ips]
+        return non_local if non_local else devices
+
+    def find_receiver(self) -> Optional[tuple]:
+        receivers = self.find_receivers()
+        return receivers[0] if receivers else None
 
     def _get_local_ipv4_addresses(self) -> set:
         addresses = {"127.0.0.1"}
@@ -101,14 +115,29 @@ class FileSender:
             pass
         return {ip for ip in addresses if ":" not in ip}
 
-    def send_file(self, receiver_ip: str) -> bool:
-        """Entry-point for sending a file with the configured options."""
-        print(f"Connecting to receiver at {receiver_ip}...")
+    def send_file(self, receiver_ips: Sequence[str]) -> bool:
+        unique_ips = list(dict.fromkeys(receiver_ips))
+        if not unique_ips:
+            safe_print("\n[ERROR] No receivers provided for transfer.")
+            return False
+
         print(f"Transfer Key: {self.transfer_key}")
-        if self.is_directory:
-            safe_print(f"[INFO] Packaging directory '{self.filename}' for streaming transfer...")
+
+        if len(unique_ips) == 1:
+            target_ip = unique_ips[0]
+            print(f"Connecting to receiver at {target_ip}...")
+            try:
+                return asyncio.run(self._async_send_file(target_ip))
+            except KeyboardInterrupt:
+                safe_print("\n[WARNING] Transfer cancelled by user.")
+                return False
+            except Exception as exc:
+                safe_print(f"\n[ERROR] Error sending file: {exc}")
+                return False
+
+        print(f"Connecting to {len(unique_ips)} receivers ({', '.join(unique_ips)})...")
         try:
-            return asyncio.run(self._async_send_file(receiver_ip))
+            return asyncio.run(self._async_send_multi(unique_ips))
         except KeyboardInterrupt:
             safe_print("\n[WARNING] Transfer cancelled by user.")
             return False
@@ -234,6 +263,205 @@ class FileSender:
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
+
+    async def _async_send_multi(self, receiver_ips: Sequence[str]) -> bool:
+        options = self.options
+        key_hash = get_key_hash(self.transfer_key)
+        compression_flag = options.enable_compression and options.compression_level > 0
+
+        segment_iv = os.urandom(16)
+        segments = [StreamSegment(start=0, length=self.file_size, iv=segment_iv)]
+        flags = 0
+        if compression_flag:
+            flags |= FLAG_COMPRESS
+        if self.is_directory:
+            flags |= FLAG_TAR_ARCHIVE
+
+        transfer_id = os.urandom(16)
+        header = self._build_header(
+            key_hash=key_hash,
+            flags=flags,
+            transfer_id=transfer_id,
+            segments=segments,
+            options=TransferOptions(
+                chunk_size=options.chunk_size,
+                enable_compression=options.enable_compression,
+                compression_level=options.compression_level,
+                parallel_streams=1,
+                fanout=options.fanout,
+            ),
+        )
+
+        connections: List[ReceiverConnection] = []
+        loop = asyncio.get_running_loop()
+
+        for ip in receiver_ips:
+            try:
+                reader, writer = await asyncio.open_connection(ip, FILE_TRANSFER_PORT)
+                self._configure_socket(writer.get_extra_info("socket"))
+                writer.write(header)
+                await writer.drain()
+                response = await asyncio.wait_for(reader.readexactly(1), timeout=30)
+                if response != b"Y":
+                    safe_print(f"[WARN] Receiver at {ip} declined the transfer.")
+                    writer.close()
+                    with contextlib.suppress(Exception):
+                        await writer.wait_closed()
+                    continue
+                connections.append(ReceiverConnection(ip, reader, writer))
+            except Exception as exc:  # pylint: disable=broad-except
+                safe_print(f"[WARN] Failed to prepare receiver {ip}: {exc}")
+
+        if not connections:
+            safe_print("\n[ERROR] No receivers accepted the transfer.")
+            return False
+
+        progress_total = self.file_size if self.file_size else None
+        progress = tqdm(total=progress_total, unit="B", unit_scale=True, desc="Uploading")
+
+        broadcast_error: Optional[Exception] = None
+
+        try:
+            if self.is_directory:
+                await self._broadcast_directory_stream(
+                    connections=connections,
+                    options=options,
+                    key_hash=key_hash,
+                    iv=segment_iv,
+                    progress=progress,
+                    loop=loop,
+                )
+            else:
+                await self._broadcast_file_stream(
+                    connections=connections,
+                    options=options,
+                    key_hash=key_hash,
+                    iv=segment_iv,
+                    progress=progress,
+                    loop=loop,
+                )
+        except Exception as exc:  # pylint: disable=broad-except
+            broadcast_error = exc
+        finally:
+            progress.close()
+
+        success = broadcast_error is None
+
+        for conn in connections:
+            try:
+                final_response = await asyncio.wait_for(conn.reader.readexactly(1), timeout=30)
+                if final_response != b"Y":
+                    safe_print(f"[ERROR] Receiver {conn.ip} reported a failure.")
+                    success = False
+            except Exception as exc:  # pylint: disable=broad-except
+                safe_print(f"[ERROR] Failed to finalize transfer with {conn.ip}: {exc}")
+                success = False
+
+        for conn in connections:
+            conn.writer.close()
+            with contextlib.suppress(Exception):
+                await conn.writer.wait_closed()
+
+        if not success:
+            if broadcast_error:
+                safe_print(f"\n[ERROR] Broadcast error: {broadcast_error}")
+            else:
+                safe_print("\n[ERROR] Multi-recipient transfer failed.")
+        else:
+            safe_print("\n[OK] Transfer completed successfully for all receivers!")
+
+        return success
+
+    async def _broadcast_file_stream(
+        self,
+        *,
+        connections: Sequence[ReceiverConnection],
+        options: TransferOptions,
+        key_hash: bytes,
+        iv: bytes,
+        progress: tqdm,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        compression_enabled = options.enable_compression and options.compression_level > 0
+        stream_cipher = AESCTREncryptor(key_hash, iv, is_encryptor=True)
+
+        def _read_chunk(handle, size) -> bytes:
+            return handle.read(size)
+
+        with open(self.filepath, "rb", buffering=options.chunk_size) as handle:
+            while True:
+                chunk = await loop.run_in_executor(None, _read_chunk, handle, options.chunk_size)
+                if not chunk:
+                    break
+
+                plain_len = len(chunk)
+                if compression_enabled:
+                    payload = await loop.run_in_executor(
+                        None,
+                        lambda data=chunk: zlib.compress(data, options.compression_level),
+                    )
+                else:
+                    payload = chunk
+
+                encrypted_payload = stream_cipher.update(payload)
+                header = struct.pack("!II", plain_len, len(payload))
+                for conn in connections:
+                    conn.writer.write(header)
+                    conn.writer.write(encrypted_payload)
+                await asyncio.gather(*(conn.writer.drain() for conn in connections))
+
+                progress.update(plain_len)
+
+        sentinel = struct.pack("!II", 0, 0)
+        for conn in connections:
+            conn.writer.write(sentinel)
+        await asyncio.gather(*(conn.writer.drain() for conn in connections))
+        stream_cipher.finalize()
+
+    async def _broadcast_directory_stream(
+        self,
+        *,
+        connections: Sequence[ReceiverConnection],
+        options: TransferOptions,
+        key_hash: bytes,
+        iv: bytes,
+        progress: tqdm,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        compression_enabled = options.enable_compression and options.compression_level > 0
+        tar_stream = TarStreamProducer(self.filepath)
+        cipher = AESCTREncryptor(key_hash, iv, is_encryptor=True)
+
+        try:
+            while True:
+                chunk = await loop.run_in_executor(None, tar_stream.read, options.chunk_size)
+                if not chunk:
+                    break
+
+                plain_len = len(chunk)
+                if compression_enabled:
+                    payload = await loop.run_in_executor(
+                        None,
+                        lambda data=chunk: zlib.compress(data, options.compression_level),
+                    )
+                else:
+                    payload = chunk
+
+                encrypted_payload = cipher.update(payload)
+                header = struct.pack("!II", plain_len, len(payload))
+                for conn in connections:
+                    conn.writer.write(header)
+                    conn.writer.write(encrypted_payload)
+                await asyncio.gather(*(conn.writer.drain() for conn in connections))
+                progress.update(plain_len)
+
+            sentinel = struct.pack("!II", 0, 0)
+            for conn in connections:
+                conn.writer.write(sentinel)
+            await asyncio.gather(*(conn.writer.drain() for conn in connections))
+            cipher.finalize()
+        finally:
+            tar_stream.close()
 
     def _suggest_stream_count(self) -> int:
         if self.file_size < 256 * 1024 * 1024:
@@ -412,16 +640,40 @@ class FileSender:
             size /= 1024.0
         return f"{size:.2f} TB"
 
+    def _compute_directory_size(self, path: str) -> int:
+        total = 0
+        for root, _, files in os.walk(path):
+            for name in files:
+                file_path = os.path.join(root, name)
+                try:
+                    if not os.path.islink(file_path):
+                        total += os.path.getsize(file_path)
+                except OSError:
+                    continue
+        return total
+
     def transfer(self) -> bool:
         safe_print("\n[SEARCHING] Searching for receivers on network...")
-        receiver = self.find_receiver()
-        if not receiver:
+        receivers = self.find_receivers()
+        if not receivers:
             safe_print("\n[ERROR] No receivers found on the network.")
             safe_print("\nMake sure the receiver is running: beam receive")
             return False
-        receiver_ip, _ = receiver
-        safe_print(f"[OK] Found receiver at {receiver_ip}")
-        return self.send_file(receiver_ip)
+
+        receiver_ips = [ip for ip, _ in receivers]
+        unique_ips = list(dict.fromkeys(receiver_ips))
+
+        if not unique_ips:
+            safe_print("\n[ERROR] No unique receivers discovered.")
+            return False
+
+        if not self.options.fanout or len(unique_ips) == 1:
+            target_ip = unique_ips[0]
+            safe_print(f"[OK] Found receiver at {target_ip}")
+            return self.send_file([target_ip])
+
+        safe_print(f"[OK] Found {len(unique_ips)} receivers: {', '.join(unique_ips)}")
+        return self.send_file(unique_ips)
 
 
 class TarStreamProducer:

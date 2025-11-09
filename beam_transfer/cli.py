@@ -34,13 +34,13 @@ def cmd_send(args):
         enable_compression=not args.no_compress,
         compression_level=args.compress_level,
         parallel_streams=args.streams,
+        fanout=not args.no_fanout,
     )
 
     # Send file
     sender = FileSender(filepath, transfer_key, options=options)
     if target_ip:
-        # Direct send to provided IP, skip discovery
-        success = sender.send_file(target_ip)
+        success = sender.send_file([target_ip])
     else:
         success = sender.transfer()
     
@@ -99,6 +99,8 @@ def main():
                              help='Zlib compression level 0-9 (default: 1)')
     send_parser.add_argument('--no-compress', action='store_true',
                              help='Disable compression even if supported')
+    send_parser.add_argument('--no-fanout', action='store_true',
+                             help='Send only to the first receiver instead of all available receivers')
     send_parser.set_defaults(func=cmd_send)
     
     # Receive command

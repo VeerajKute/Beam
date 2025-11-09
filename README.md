@@ -8,13 +8,14 @@ Beam Transfer allows you to effortlessly transfer files between devices connecte
 
 ##  Features
 
--  **High-speed transfers** - Optimized for fast local network file transfers
--  **AES-256 encryption** - Your files are encrypted during transfer
--  **Key-based verification** - Prevents unauthorized access with unique transfer keys
--  **Progress tracking** - Real-time progress bars for uploads and downloads
--  **Auto-discovery** - Automatically finds receivers on your network
--  **Cross-platform** - Works on Windows, macOS, and Linux
--  **Simple CLI** - Easy-to-use command-line interface
+-  **High-speed transfers** – Async pipeline with optional multi-stream TCP sends keeps the link saturated
+-  **AES-256 encryption** – Streamed AES-CTR encryption protects your data end-to-end
+-  **Key-based verification** – Prevents unauthorized access with unique transfer keys
+-  **Progress tracking** – Real-time progress bars for uploads and downloads (files and folders)
+-  **Auto-discovery** – Automatically finds receivers on your network
+-  **Multi-recipient fanout** – Broadcast the same transfer to multiple receivers that enter the key
+-  **Directory streaming** – Send entire folders without temporary archives via on-the-fly tar streaming
+-  **Configurable CLI** – Tune chunk size, compression level, stream count, and disable/enable fanout quickly
 
 ---
 
@@ -24,7 +25,7 @@ Beam Transfer allows you to effortlessly transfer files between devices connecte
 
 - Python 3.8 or higher
 - pip (Python package installer)
-- Both devices must be on the same Wi-Fi network or hotspot
+- All devices on the same Wi-Fi network or hotspot
 
 ### Install from Source
 
@@ -40,7 +41,7 @@ pip install .
 pip3 install .
 ```
 
-This will install `beam` command globally on your system.
+This installs the `beam` command globally on your system.
 
 ---
 
@@ -48,7 +49,7 @@ This will install `beam` command globally on your system.
 
 ### 1. Start the Receiver
 
-On the device that will receive the file:
+On every device that should receive files:
 
 ```bash
 beam receive
@@ -57,67 +58,49 @@ beam receive
 Or specify a download directory:
 
 ```bash
-beam receive -d ~/Downloads
+beam receive -d ~/Transfers
 ```
 
-The receiver will start listening for incoming transfers and display:
+Leave the receiver running; each device will show a prompt when a transfer request arrives.
 
-```
- Receiver is listening for incoming transfers...
-Download directory: /path/to/download
+### 2. Send a File or Directory
 
-Press Ctrl+C to stop
-```
-
-### 2. Send a File
-
-On the device that has the file, navigate to the folder containing the file:
+On the sending device:
 
 ```bash
-# From any folder
-beam send document.pdf
+# Send a single file
+beam send movie.mkv
 
-# Or with absolute path
-beam send C:\Users\YourName\Documents\video.mp4
+# Stream an entire folder
+beam send ./project-folder
 ```
 
-The sender will:
-1. Automatically discover the receiver
-2. Display transfer details with a unique key
-3. Send the encrypted file
+If multiple receivers are listening and enter the same key, the sender will stream the file/folder to all of them simultaneously.
 
-**Receiver will see:**
+**Sender output (fanout example):**
 ```
-============================================================
-Incoming file: document.pdf
-Size: 2.45 MB
-From: 192.168.1.100
-============================================================
-Accept this transfer? (y/n):
-```
-
-Type `y` to accept, then enter the transfer key displayed on the sender's screen.
-
-**Sender will see:**
-```
- Searching for receivers on network...
-✓ Found receiver at 192.168.1.105
-Connecting to receiver at 192.168.1.105...
-Sending file: document.pdf (2.45 MB)
+[SEARCHING] Searching for receivers on network...
+[OK] Found 2 receivers: 192.168.1.105, 192.168.1.144
 Transfer Key: A7K9X2
-------------------------------------------------------------
-Uploading: 100%|████████████████| 2.57M/2.57M [00:01<00:00, 1.50MB/s]
+Connecting to 2 receivers (192.168.1.105, 192.168.1.144)...
+Uploading: 100%|████████████████| 2.57G/2.57G [00:52<00:00, 49.8MB/s]
 
-✓ File sent successfully!
+[OK] Transfer completed successfully for all receivers!
 ```
 
-**Receiver will see:**
+**Receiver output:**
 ```
-✓ Key verified. Transferring file...
-Downloading: 100%|████████████████| 2.57M/2.57M [00:01<00:00, 1.50MB/s]
-
-✓ File saved to: /path/to/download/document.pdf
-✓ File received successfully!
+============================================================
+Incoming directory: project-folder
+Size: streaming
+Streams: 1
+Compression: Off
+============================================================
+Accept this transfer? (y/n): y
+Enter transfer key: A7K9X2
+[OK] Key verified. Transferring files...
+Downloading: 100%|████████████████| 2.57G/2.57G [00:52<00:00, 49.8MB/s]
+[OK] Directory saved to: /path/to/download/project-folder
 ```
 
 ---
@@ -136,58 +119,72 @@ beam receive
 beam send photo.jpg
 ```
 
+### Sending a Directory
+
+```bash
+beam send ./assets
+```
+
+### Broadcast to Multiple Receivers
+
+Start `beam receive` on each target device, then run:
+
+```bash
+beam send presentation.pdf
+```
+
+Every receiver that enters the displayed key receives the same encrypted stream. Use `--no-fanout` if you want to send only to the first responder.
+
 ### Specifying Download Directory
 
-**Receiver:**
 ```bash
 beam receive -d ~/Downloads/Transfers
 ```
-
-### Multiple File Transfers
-
-The receiver can handle multiple transfers sequentially. Just keep it running and accept transfers as they come in.
 
 ---
 
 ##  Advanced Usage
 
-### Using a Custom Transfer Key
-
-You can specify your own transfer key for additional security:
+Customize the transfer pipeline with these flags:
 
 ```bash
-beam send document.pdf -k MYCUSTOMKEY
+beam send large.iso \
+  --streams 3 \
+  --chunk-size $((8 * 1024 * 1024)) \
+  --compress-level 0 \
+  --no-fanout
 ```
 
-The receiver must enter exactly this key to accept the transfer.
+- `--streams` – parallel TCP streams per receiver (files only)
+- `--chunk-size` – bytes per read/encrypt/send (default 4 MB)
+- `--compress-level` – zlib compression level (0 disables compression)
+- `--no-compress` – convenience flag to disable compression
+- `--no-fanout` – send only to the first receiver, even if others respond
+- `-k/--key` – provide your own transfer key
 
 ### Checking Installation
-
-To verify that Beam Transfer is installed correctly:
 
 ```bash
 beam --help
 ```
 
-You should see the help menu with available commands.
-
 ---
 
 ##  Security Features
 
-1. **AES-256 Encryption**: All file transfers are encrypted using industry-standard AES-256-CBC encryption
-2. **Key Verification**: Each transfer requires a unique alphanumeric key (6 characters by default)
-3. **Network Discovery**: Only devices that respond to discovery broadcasts can initiate transfers
-4. **Connection Timeouts**: Automatic timeout handling prevents hanging connections
+1. **AES-256-CTR Encryption** – Streaming cipher keeps latency low without sacrificing security
+2. **Key Verification** – Transfers require a short alphanumeric key displayed on the sender
+3. **Network Discovery** – Only devices that answer discovery broadcasts can join the transfer
+4. **Connection Timeouts** – Automatic timeouts protect against stalled sockets
 
 ### How It Works
 
-1. **Discovery**: The sender broadcasts a discovery message on the local network
-2. **Verification**: The receiver must be actively listening and responding to discovery requests
-3. **Handshake**: The sender and receiver establish a secure TCP connection
-4. **Key Exchange**: The sender transmits the key hash to the receiver
-5. **Encryption**: Files are encrypted in 64KB chunks before transmission
-6. **Confirmation**: The receiver must provide the correct key to decrypt and save the file
+1. **Discovery** – The sender broadcasts a discovery message on the local network
+2. **Verification** – Receivers respond only if they are actively listening
+3. **Handshake** – Sender and receiver(s) establish secure TCP connections
+4. **Key Exchange** – Sender transmits a hash of the transfer key; receiver must match it
+5. **Streaming Encryption** – Files/folders are read in large chunks, optionally compressed, encrypted with AES-CTR, then streamed
+6. **Confirmation** – Each receiver acknowledges success or reports failure at the end
 
 ---
 
@@ -195,35 +192,25 @@ You should see the help menu with available commands.
 
 ```
 beam_transfer/
-├── __init__.py          # Package initialization
-├── cli.py               # Command-line interface
-├── sender.py            # File sending logic
-├── receiver.py          # File receiving logic
-├── network.py           # Network discovery and communication
-└── security.py          # Encryption and key management
+├── __init__.py
+├── cli.py               # Command-line interface and option parsing
+├── sender.py            # Async transfer engine, fanout, tar streaming
+├── receiver.py          # Async receiver server, extraction pipeline
+├── network.py           # Discovery broadcasts and UDP responses
+├── security.py          # AES helpers and key hashing
+└── utils.py             # Console utilities and helpers
 ```
-
-### Key Components
-
-- **NetworkDiscovery**: Handles UDP broadcasting for device discovery
-- **ConnectionHandler**: Manages TCP connections for file transfers
-- **FileSender**: Orchestrates file sending with encryption
-- **FileReceiver**: Handles incoming transfers with decryption
-- **AESEncryptor**: Provides AES-256-CBC encryption/decryption
 
 ---
 
-##  Configuration
-
-### Default Settings
+##  Configuration Defaults
 
 - **Broadcast Port**: 25000 (UDP for discovery)
-- **Transfer Port**: 25001 (TCP for file transfer)
-- **Discovery Timeout**: 3 seconds
-- **Chunk Size**: 64 KB
-- **Connection Timeout**: 30-60 seconds
-
-These are currently hardcoded but can be customized in the source code if needed.
+- **Transfer Port**: 25001 (TCP for encrypted data)
+- **Discovery Timeout**: ~3 seconds
+- **Chunk Size**: 4 MB (configurable)
+- **Parallel Streams**: 1 per receiver (configurable)
+- **Fanout**: Enabled (disable with `--no-fanout`)
 
 ---
 
@@ -232,61 +219,55 @@ These are currently hardcoded but can be customized in the source code if needed
 ### "No receivers found on the network"
 
 **Solution:**
-1. Ensure both devices are on the same Wi-Fi network or hotspot
-2. Make sure the receiver is running with `beam receive`
-3. Check that firewall/antivirus isn't blocking ports 25000-25001
-4. Try disabling VPN if active
+1. Ensure all devices share the same Wi-Fi network or hotspot
+2. Make sure each receiver is running `beam receive`
+3. Check firewall/antivirus settings for ports 25000–25001
+4. Temporarily disable VPN if active
 
 ### "Connection refused" or "Connection timeout"
 
 **Solution:**
-1. Verify firewall settings allow incoming connections on port 25001
-2. Ensure receiver is listening: check for "🟢 Receiver is listening" message
-3. Try restarting both sender and receiver
+1. Verify firewall rules allow inbound TCP on port 25001
+2. Confirm the receiver is listening (look for the READY banner)
+3. Restart both sender and receiver processes
 
 ### "Invalid transfer key"
 
 **Solution:**
-- Make sure you're entering the exact key shown on the sender's screen
-- Keys are case-insensitive, but verify you have the right characters
+- Enter the exact key shown on the sender (case-insensitive)
+- Double-check that you’re typing the characters correctly
 
 ### Installation Issues
 
-**"beam: command not found"**
-
-**Solution:**
 ```bash
-# Ensure pip install path is in your PATH environment variable
-# Try reinstalling:
 pip install --upgrade --force-reinstall .
-
-# On Windows, you may need to add Python Scripts to PATH
 ```
+Make sure the Python Scripts directory (or equivalent) is on your system PATH.
+
+---
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please open a Pull Request with your improvements or ideas.
 
 ---
 
 ##  Roadmap
 
 Future enhancements:
-- Transfer progress persistence across disconnections
-- Directory/folder transfers
-- Transfer history and logs
-- GUI alternative to CLI
-- Transfer scheduling
-- Bandwidth throttling controls
+- Resume/retry support for interrupted transfers
+- Transfer history/logging
+- Optional bandwidth throttling
+- GUI front-end companion
 
 ---
 
 ##  Acknowledgments
 
 Built with:
-- Python `cryptography` library for encryption
+- Python `cryptography` for AES-CTR encryption
 - `tqdm` for progress bars
-- Standard library `socket` for network operations
+- Standard library `asyncio`/`socket` for networking
 
 ---
 
