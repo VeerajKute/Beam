@@ -20,12 +20,13 @@ def cmd_send(args):
     target_ip = getattr(args, 'ip', None)
     
     # Validate file exists
-    if not Path(filepath).exists():
-        safe_print(f"[ERROR] File '{filepath}' not found.")
+    path_obj = Path(filepath)
+    if not path_obj.exists():
+        safe_print(f"[ERROR] File or directory '{filepath}' not found.")
         sys.exit(1)
     
-    if not Path(filepath).is_file():
-        safe_print(f"[ERROR] '{filepath}' is not a file.")
+    if not (path_obj.is_file() or path_obj.is_dir()):
+        safe_print(f"[ERROR] '{filepath}' is not a regular file or directory.")
         sys.exit(1)
     
     options = TransferOptions(
@@ -87,7 +88,7 @@ def main():
     
     # Send command
     send_parser = subparsers.add_parser('send', help='Send a file')
-    send_parser.add_argument('file', help='File to send')
+    send_parser.add_argument('file', help='File or directory to send')
     send_parser.add_argument('-k', '--key', help='Transfer key (auto-generated if not provided)')
     send_parser.add_argument('--ip', help='Receiver IP address (skip discovery and send directly)')
     send_parser.add_argument('--chunk-size', type=int, default=4 * 1024 * 1024,

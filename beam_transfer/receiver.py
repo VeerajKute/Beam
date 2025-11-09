@@ -7,9 +7,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import queue
+import shutil
 import socket
 import struct
 import threading
+import tarfile
 import zlib
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -19,6 +22,10 @@ from tqdm import tqdm
 from beam_transfer.network import BROADCAST_PORT, FILE_TRANSFER_PORT, NetworkDiscovery
 from beam_transfer.security import AESCTREncryptor, get_key_hash
 from beam_transfer.utils import safe_print
+
+FLAG_COMPRESS = 0x01
+FLAG_MULTI_STREAM = 0x02
+FLAG_TAR_ARCHIVE = 0x04
 
 
 @dataclass
@@ -139,7 +146,8 @@ class FileReceiver:
         )
         transfer_id = await reader.readexactly(16)
 
-        compression_enabled = bool(flags & 0x01) and compression_level > 0
+        compression_enabled = bool(flags & FLAG_COMPRESS) and compression_level > 0
+        is_tar_archive = bool(flags & FLAG_TAR_ARCHIVE)
 
         streams: Dict[int, StreamInfo] = {}
         for idx in range(stream_count):
@@ -148,8 +156,11 @@ class FileReceiver:
             streams[idx] = StreamInfo(index=idx, iv=iv, offset=offset, length=length)
 
         safe_print(f"\n{'=' * 60}")
-        safe_print(f"Incoming file: {filename}")
-        safe_print(f"Size: {self._format_size(file_size)}")
+        safe_print(f"Incoming {'directory' if is_tar_archive else 'file'}: {filename}")
+        if file_size:
+            safe_print(f"Size: {self._format_size(file_size)}")
+        else:
+            safe_print("Size: streaming")
         safe_print(f"Streams: {stream_count}")
         safe_print(f"Compression: {'On' if compression_enabled else 'Off'}")
         safe_print(f"{'=' * 60}")
@@ -177,6 +188,35 @@ class FileReceiver:
             return
 
         os.makedirs(self.download_dir, exist_ok=True)
+        writer.write(b"Y")
+        await writer.drain()
+
+        if is_tar_archive:
+            success, target_dir, error = await self._handle_tar_transfer(
+                reader=reader,
+                iv=streams[0].iv,
+                file_size=file_size,
+                key_hash=key_hash,
+                compression_enabled=compression_enabled,
+                base_name=filename,
+            )
+
+            if success:
+                writer.write(b"Y")
+                await writer.drain()
+                safe_print(f"[OK] Directory saved to: {os.path.abspath(target_dir)}")
+            else:
+                writer.write(b"N")
+                await writer.drain()
+                if target_dir:
+                    shutil.rmtree(target_dir, ignore_errors=True)
+                safe_print(f"\n[ERROR] Transfer failed: {error}")
+
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            return
+
         filepath = os.path.join(self.download_dir, filename)
         with open(filepath, "wb") as temp_file:
             temp_file.truncate(file_size)
@@ -196,9 +236,6 @@ class FileReceiver:
             loop=loop,
         )
         self._active_transfers[transfer_id] = state
-
-        writer.write(b"Y")
-        await writer.drain()
 
         first_stream = streams[0]
         task = asyncio.create_task(
@@ -304,33 +341,180 @@ class FileReceiver:
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
 
-    def stop(self) -> None:
-        if self._server:
-            self._server.close()
+    async def _handle_tar_transfer(
+        self,
+        *,
+        reader: asyncio.StreamReader,
+        iv: bytes,
+        file_size: int,
+        key_hash: bytes,
+        compression_enabled: bool,
+        base_name: str,
+    ) -> tuple[bool, Optional[str], Optional[Exception]]:
+        loop = asyncio.get_running_loop()
+        target_dir = self._resolve_target_directory(base_name)
+        os.makedirs(target_dir, exist_ok=True)
 
-    def _configure_socket(self, sock: Optional[socket.socket]) -> None:
-        if not sock:
+        total = file_size if file_size else None
+        progress = tqdm(total=total, unit="B", unit_scale=True, desc="Downloading")
+        extraction = TarExtractionWorker(target_dir)
+        cipher = AESCTREncryptor(key_hash, iv, is_encryptor=False)
+
+        success = False
+        error: Optional[Exception] = None
+
+        try:
+            while True:
+                header = await reader.readexactly(8)
+                plain_len, payload_len = struct.unpack("!II", header)
+                if plain_len == 0 and payload_len == 0:
+                    break
+
+                ciphertext = await reader.readexactly(payload_len)
+                payload = cipher.update(ciphertext)
+
+                if compression_enabled:
+                    chunk = await loop.run_in_executor(None, zlib.decompress, payload)
+                else:
+                    chunk = payload
+
+                if len(chunk) != plain_len:
+                    raise ValueError("Chunk length mismatch detected")
+
+                extraction.feed(chunk)
+                progress.update(plain_len)
+
+            success = True
+        except Exception as exc:  # pylint: disable=broad-except
+            error = exc
+        finally:
+            extraction.close()
+            try:
+                await loop.run_in_executor(None, extraction.wait)
+            except Exception as exc:  # pylint: disable=broad-except
+                if not error:
+                    error = exc
+                success = False
+            cipher.finalize()
+            progress.close()
+
+        return success, target_dir, error
+
+    def _resolve_target_directory(self, name: str) -> str:
+        base_name = os.path.basename(name.rstrip(os.sep)) or "beam_transfer"
+        candidate = os.path.join(self.download_dir, base_name)
+        counter = 1
+        while os.path.exists(candidate):
+            candidate = os.path.join(self.download_dir, f"{base_name}_{counter}")
+            counter += 1
+        return candidate
+
+
+class TarQueueReader:
+    """File-like reader that pulls tar bytes from a queue."""
+
+    def __init__(self, data_queue: "queue.Queue[Optional[bytes]]"):
+        self._queue = data_queue
+        self._buffer = bytearray()
+        self._finished = False
+
+    def read(self, size: int = -1) -> bytes:  # type: ignore[override]
+        while (size < 0 or len(self._buffer) < size) and not self._finished:
+            chunk = self._queue.get()
+            if chunk is None:
+                self._finished = True
+                break
+            self._buffer.extend(chunk)
+
+        if size < 0 or size > len(self._buffer):
+            size = len(self._buffer)
+
+        if size == 0:
+            return b""
+
+        data = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return data
+
+
+class TarExtractionWorker:
+    """Extract tar bytes fed over time into a target directory."""
+
+    def __init__(self, target_dir: str):
+        self.target_dir = target_dir
+        self._queue: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=4)
+        self._reader = TarQueueReader(self._queue)
+        self._closed = False
+        self.error: Optional[Exception] = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            with tarfile.open(fileobj=self._reader, mode="r|*") as tar:
+                self._extract_members(tar)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.error = exc
+
+    def _extract_members(self, tar: tarfile.TarFile) -> None:
+        base_dir = os.path.abspath(self.target_dir)
+        for member in tar:
+            if not member.name:
+                continue
+            member_name = member.name.lstrip("./")
+            target_path = _safe_join(base_dir, member_name)
+
+            if member.isdir():
+                os.makedirs(target_path, exist_ok=True)
+                continue
+
+            if member.islnk() or member.issym():
+                # Skip links for safety in streaming mode
+                continue
+
+            parent = os.path.dirname(target_path)
+            os.makedirs(parent, exist_ok=True)
+
+            extracted = tar.extractfile(member)
+            if extracted is None:
+                continue
+            with extracted as src, open(target_path, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+            if member.mode:
+                try:
+                    os.chmod(target_path, member.mode)
+                except PermissionError:
+                    pass
+            if member.mtime:
+                try:
+                    os.utime(target_path, (member.mtime, member.mtime))
+                except OSError:
+                    pass
+
+    def feed(self, data: bytes) -> None:
+        if self._closed or not data:
             return
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
-        except Exception:
-            pass
-        try:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except Exception:
-            pass
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        except Exception:
-            pass
+        self._queue.put(data)
 
-    @staticmethod
-    def _format_size(size: int) -> str:
-        for unit in ["B", "KB", "MB", "GB"]:
-            if size < 1024.0:
-                return f"{size:.2f} {unit}"
-            size /= 1024.0
-        return f"{size:.2f} TB"
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._queue.put(None)
+
+    def wait(self) -> None:
+        if self._thread.is_alive():
+            self._thread.join()
+        if self.error:
+            raise self.error
+
+
+def _safe_join(base_dir: str, member_name: str) -> str:
+    base_abs = os.path.abspath(base_dir)
+    target = os.path.abspath(os.path.join(base_abs, member_name))
+    if not target.startswith(base_abs + os.sep) and target != base_abs:
+        raise ValueError(f"Blocked unsafe path: {member_name}")
+    return target
 
 
 class ReceiverDiscovery:

@@ -8,8 +8,11 @@ import asyncio
 import contextlib
 import math
 import os
+import queue
 import socket
 import struct
+import tarfile
+import threading
 import zlib
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
@@ -19,6 +22,11 @@ from tqdm import tqdm
 from beam_transfer.network import FILE_TRANSFER_PORT, NetworkDiscovery
 from beam_transfer.security import AESCTREncryptor, generate_transfer_key, get_key_hash
 from beam_transfer.utils import safe_print
+
+
+FLAG_COMPRESS = 0x01
+FLAG_MULTI_STREAM = 0x02
+FLAG_TAR_ARCHIVE = 0x04
 
 
 @dataclass
@@ -55,8 +63,9 @@ class FileSender:
         options: Optional[TransferOptions] = None,
     ):
         self.filepath = filepath
-        self.filename = os.path.basename(filepath)
-        self.file_size = os.path.getsize(filepath)
+        self.filename = os.path.basename(os.path.normpath(filepath))
+        self.is_directory = os.path.isdir(filepath)
+        self.file_size = 0 if self.is_directory else os.path.getsize(filepath)
         self.transfer_key = transfer_key or generate_transfer_key()
         self.options = (options or TransferOptions()).normalized()
 
@@ -96,6 +105,8 @@ class FileSender:
         """Entry-point for sending a file with the configured options."""
         print(f"Connecting to receiver at {receiver_ip}...")
         print(f"Transfer Key: {self.transfer_key}")
+        if self.is_directory:
+            safe_print(f"[INFO] Packaging directory '{self.filename}' for streaming transfer...")
         try:
             return asyncio.run(self._async_send_file(receiver_ip))
         except KeyboardInterrupt:
@@ -111,16 +122,23 @@ class FileSender:
 
         key_hash = get_key_hash(self.transfer_key)
         options = self.options
-        stream_count = min(options.parallel_streams, self._suggest_stream_count())
-        segments = self._build_segments(stream_count)
-        transfer_id = os.urandom(16)
+
+        if self.is_directory:
+            stream_count = 1
+            segments = [StreamSegment(start=0, length=0, iv=os.urandom(16))]
+        else:
+            stream_count = min(options.parallel_streams, self._suggest_stream_count())
+            segments = self._build_segments(stream_count)
 
         flags = 0
         if options.enable_compression and options.compression_level > 0:
-            flags |= 0x01
+            flags |= FLAG_COMPRESS
         if stream_count > 1:
-            flags |= 0x02
+            flags |= FLAG_MULTI_STREAM
+        if self.is_directory:
+            flags |= FLAG_TAR_ARCHIVE
 
+        transfer_id = os.urandom(16)
         header = self._build_header(
             key_hash=key_hash,
             flags=flags,
@@ -142,54 +160,59 @@ class FileSender:
             await writer.wait_closed()
             return False
 
-        safe_print(
-            f"Sending file: {self.filename} "
-            f"({self._format_size(self.file_size)})"
-        )
-        safe_print("-" * 60)
-
-        progress = tqdm(total=self.file_size, unit="B", unit_scale=True, desc="Uploading")
-        stream_tasks = []
+        progress_total = self.file_size if self.file_size else None
+        progress = tqdm(total=progress_total, unit="B", unit_scale=True, desc="Uploading")
+        stream_tasks: List[asyncio.Task] = []
         loop = asyncio.get_running_loop()
 
         try:
-            stream_tasks.append(
-                asyncio.create_task(
-                    self._send_stream(
-                        stream_index=0,
-                        segment=segments[0],
-                        writer=writer,
-                        options=options,
-                        key_hash=key_hash,
-                        progress=progress,
-                        loop=loop,
-                        close_writer=False,
-                    )
+            if self.is_directory:
+                await self._send_directory_stream(
+                    writer=writer,
+                    options=options,
+                    key_hash=key_hash,
+                    iv=segments[0].iv,
+                    progress=progress,
+                    loop=loop,
                 )
-            )
-
-            for idx in range(1, stream_count):
-                sr, sw = await asyncio.open_connection(receiver_ip, FILE_TRANSFER_PORT)
-                self._configure_socket(sw.get_extra_info("socket"))
-                handshake = struct.pack("!4sH16s", b"STRM", idx, transfer_id)
-                sw.write(handshake)
-                await sw.drain()
+            else:
                 stream_tasks.append(
                     asyncio.create_task(
                         self._send_stream(
-                            stream_index=idx,
-                            segment=segments[idx],
-                            writer=sw,
+                            stream_index=0,
+                            segment=segments[0],
+                            writer=writer,
                             options=options,
                             key_hash=key_hash,
                             progress=progress,
                             loop=loop,
-                            close_writer=True,
+                            close_writer=False,
                         )
                     )
                 )
 
-            await asyncio.gather(*stream_tasks)
+                for idx in range(1, stream_count):
+                    sr, sw = await asyncio.open_connection(receiver_ip, FILE_TRANSFER_PORT)
+                    self._configure_socket(sw.get_extra_info("socket"))
+                    handshake = struct.pack("!4sH16s", b"STRM", idx, transfer_id)
+                    sw.write(handshake)
+                    await sw.drain()
+                    stream_tasks.append(
+                        asyncio.create_task(
+                            self._send_stream(
+                                stream_index=idx,
+                                segment=segments[idx],
+                                writer=sw,
+                                options=options,
+                                key_hash=key_hash,
+                                progress=progress,
+                                loop=loop,
+                                close_writer=True,
+                            )
+                        )
+                    )
+
+                await asyncio.gather(*stream_tasks)
 
             try:
                 final_response = await asyncio.wait_for(reader.readexactly(1), timeout=30)
@@ -197,7 +220,7 @@ class FileSender:
                 raise RuntimeError("Timed out waiting for receiver acknowledgement") from exc
 
             if final_response == b"Y":
-                safe_print("\n[OK] File sent successfully!")
+                safe_print("\n[OK] Transfer completed successfully!")
                 return True
 
             safe_print("\n[ERROR] Receiver reported a failure.")
@@ -324,6 +347,48 @@ class FileSender:
                 if close_writer:
                     await writer.wait_closed()
 
+    async def _send_directory_stream(
+        self,
+        *,
+        writer: asyncio.StreamWriter,
+        options: TransferOptions,
+        key_hash: bytes,
+        iv: bytes,
+        progress: tqdm,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        compression_enabled = options.enable_compression and options.compression_level > 0
+        tar_stream = TarStreamProducer(self.filepath)
+        cipher = AESCTREncryptor(key_hash, iv, is_encryptor=True)
+
+        try:
+            while True:
+                chunk = await loop.run_in_executor(None, tar_stream.read, options.chunk_size)
+                if not chunk:
+                    break
+
+                plain_len = len(chunk)
+                if compression_enabled:
+                    payload = await loop.run_in_executor(
+                        None,
+                        lambda data=chunk: zlib.compress(data, options.compression_level),
+                    )
+                else:
+                    payload = chunk
+
+                encrypted_payload = cipher.update(payload)
+                header = struct.pack("!II", plain_len, len(payload))
+                writer.write(header)
+                writer.write(encrypted_payload)
+                await writer.drain()
+                progress.update(plain_len)
+
+            writer.write(struct.pack("!II", 0, 0))
+            await writer.drain()
+            cipher.finalize()
+        finally:
+            tar_stream.close()
+
     def _configure_socket(self, sock: Optional[socket.socket]) -> None:
         if not sock:
             return
@@ -357,4 +422,53 @@ class FileSender:
         receiver_ip, _ = receiver
         safe_print(f"[OK] Found receiver at {receiver_ip}")
         return self.send_file(receiver_ip)
+
+
+class TarStreamProducer:
+    """Stream tar archive data for a directory without temporary files."""
+
+    def __init__(self, root_path: str):
+        self.root_path = os.path.abspath(root_path)
+        self.arcname = os.path.basename(os.path.normpath(root_path))
+        self._queue: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=4)
+        self._buffer = bytearray()
+        self._finished = False
+        self._thread = threading.Thread(target=self._produce, daemon=True)
+        self._thread.start()
+
+    def _produce(self) -> None:
+        try:
+            with tarfile.open(fileobj=self, mode="w|", format=tarfile.GNU_FORMAT) as tar:
+                tar.add(self.root_path, arcname=self.arcname)
+        finally:
+            self._queue.put(None)
+
+    # tarfile calls this method while building the archive
+    def write(self, data: bytes) -> None:  # type: ignore[override]
+        if data:
+            self._queue.put(data)
+
+    def read(self, size: int) -> bytes:
+        while (size < 0 or len(self._buffer) < size) and not self._finished:
+            chunk = self._queue.get()
+            if chunk is None:
+                self._finished = True
+                break
+            self._buffer.extend(chunk)
+
+        if size < 0 or size > len(self._buffer):
+            size = len(self._buffer)
+
+        if size == 0:
+            return b""
+
+        data = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return data
+
+    def close(self) -> None:
+        self._finished = True
+        if self._thread.is_alive():
+            self._queue.put(None)
+            self._thread.join(timeout=1.0)
 
