@@ -409,6 +409,22 @@ class FileReceiver:
             counter += 1
         return candidate
 
+    def _configure_socket(self, sock: Optional[socket.socket]) -> None:
+        if not sock:
+            return
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
+        except Exception:
+            pass
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except Exception:
+            pass
+
 
 class TarQueueReader:
     """File-like reader that pulls tar bytes from a queue."""
