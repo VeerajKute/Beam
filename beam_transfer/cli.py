@@ -5,7 +5,7 @@ Command-line interface for Beam Transfer.
 import argparse
 import sys
 from pathlib import Path
-from beam_transfer.sender import FileSender
+from beam_transfer.sender import FileSender, TransferOptions
 from beam_transfer.receiver import FileReceiver, ReceiverDiscovery
 from beam_transfer.utils import safe_print, setup_windows_encoding
 
@@ -28,8 +28,15 @@ def cmd_send(args):
         safe_print(f"[ERROR] '{filepath}' is not a file.")
         sys.exit(1)
     
+    options = TransferOptions(
+        chunk_size=args.chunk_size,
+        enable_compression=not args.no_compress,
+        compression_level=args.compress_level,
+        parallel_streams=args.streams,
+    )
+
     # Send file
-    sender = FileSender(filepath, transfer_key)
+    sender = FileSender(filepath, transfer_key, options=options)
     if target_ip:
         # Direct send to provided IP, skip discovery
         success = sender.send_file(target_ip)
@@ -57,12 +64,15 @@ def cmd_receive(args):
         # Start receiver
         receiver = FileReceiver(str(download_path))
         receiver.start_listening()
+        discovery.stop_announcing()
         
     except KeyboardInterrupt:
         safe_print("\n\n[WARNING] Shutting down...")
+        discovery.stop_announcing()
         sys.exit(0)
     except Exception as e:
         safe_print(f"\n[ERROR] Error: {e}")
+        discovery.stop_announcing()
         sys.exit(1)
 
 
@@ -80,6 +90,14 @@ def main():
     send_parser.add_argument('file', help='File to send')
     send_parser.add_argument('-k', '--key', help='Transfer key (auto-generated if not provided)')
     send_parser.add_argument('--ip', help='Receiver IP address (skip discovery and send directly)')
+    send_parser.add_argument('--chunk-size', type=int, default=4 * 1024 * 1024,
+                             help='Chunk size in bytes (default: 4MB)')
+    send_parser.add_argument('--streams', type=int, default=1,
+                             help='Number of parallel data streams (default: 1, max: 4)')
+    send_parser.add_argument('--compress-level', type=int, default=1,
+                             help='Zlib compression level 0-9 (default: 1)')
+    send_parser.add_argument('--no-compress', action='store_true',
+                             help='Disable compression even if supported')
     send_parser.set_defaults(func=cmd_send)
     
     # Receive command
