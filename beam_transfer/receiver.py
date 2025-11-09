@@ -147,9 +147,11 @@ class FileReceiver:
         chunk_queue: "queue.Queue[Optional[bytearray]]" = queue.Queue(maxsize=6)
         network_error: list[Exception] = []
         network_stop = threading.Event()
+        bytes_expected = file_size
 
         def _network_reader() -> None:
             try:
+                bytes_received_total = 0
                 while True:
                     chunk_size_data = sock.recv(4)
                     if len(chunk_size_data) != 4:
@@ -172,6 +174,10 @@ class FileReceiver:
                         break
 
                     chunk_queue.put(encrypted_chunk)
+                    bytes_received_total += encrypted_chunk_size
+
+                    if bytes_received_total >= bytes_expected:
+                        break
             except Exception as exc:
                 network_error.append(exc)
             finally:
