@@ -425,6 +425,14 @@ class FileReceiver:
         except Exception:
             pass
 
+    @staticmethod
+    def _format_size(size: int) -> str:
+        for unit in ["B", "KB", "MB", "GB"]:
+            if size < 1024.0:
+                return f"{size:.2f} {unit}"
+            size /= 1024.0
+        return f"{size:.2f} TB"
+
 
 class TarQueueReader:
     """File-like reader that pulls tar bytes from a queue."""
