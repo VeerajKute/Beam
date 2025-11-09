@@ -3,6 +3,7 @@ Receiver module for accepting file transfers.
 """
 
 import os
+import queue
 import socket
 import struct
 import threading
@@ -41,6 +42,10 @@ class FileReceiver:
                     try:
                         # Increase socket receive buffer to improve throughput
                         client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+                    except Exception:
+                        pass
+                    try:
+                        client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                     except Exception:
                         pass
                     
@@ -139,42 +144,69 @@ class FileReceiver:
         # Initialize streaming decryption (CTR) with the session IV
         cipher = AESCTREncryptor(key_hash, session_iv, is_encryptor=False)
         
-        # Receive and decrypt file
-        received_bytes = 0
-        with open(filepath, 'wb') as f:
-            from tqdm import tqdm
-            with tqdm(total=file_size, unit='B', unit_scale=True, desc="Downloading") as pbar:
-                while received_bytes < file_size:
-                    # Receive chunk size
+        chunk_queue: "queue.Queue[Optional[bytearray]]" = queue.Queue(maxsize=6)
+        network_error: list[Exception] = []
+        network_stop = threading.Event()
+
+        def _network_reader() -> None:
+            try:
+                while True:
                     chunk_size_data = sock.recv(4)
                     if len(chunk_size_data) != 4:
                         break
-                    
+
                     encrypted_chunk_size = struct.unpack('!I', chunk_size_data)[0]
-                    
-                    # Receive encrypted chunk
-                    # Read encrypted chunk directly into a preallocated buffer
                     encrypted_chunk = bytearray(encrypted_chunk_size)
                     view = memoryview(encrypted_chunk)
                     bytes_read = 0
                     while bytes_read < encrypted_chunk_size:
-                        n = sock.recv_into(view[bytes_read:], min(encrypted_chunk_size - bytes_read, self.chunk_size))
+                        n = sock.recv_into(
+                            view[bytes_read:],
+                            min(encrypted_chunk_size - bytes_read, self.chunk_size),
+                        )
                         if not n:
                             break
                         bytes_read += n
-                    
+
                     if bytes_read != encrypted_chunk_size:
                         break
-                    
-                    # Decrypt chunk
-                    try:
-                        decrypted_chunk = cipher.update(encrypted_chunk)
-                        f.write(decrypted_chunk)
-                        received_bytes += len(decrypted_chunk)
-                        pbar.update(len(decrypted_chunk))
-                    except Exception as e:
-                        print(f"\nDecryption error: {e}")
+
+                    chunk_queue.put(encrypted_chunk)
+            except Exception as exc:
+                network_error.append(exc)
+            finally:
+                network_stop.set()
+                chunk_queue.put(None)
+
+        reader_thread = threading.Thread(target=_network_reader, daemon=True)
+        reader_thread.start()
+
+        received_bytes = 0
+        with open(filepath, 'wb', buffering=self.chunk_size) as f:
+            from tqdm import tqdm
+            with tqdm(total=file_size, unit='B', unit_scale=True, desc="Downloading") as pbar:
+                while received_bytes < file_size:
+                    chunk = chunk_queue.get()
+                    if chunk is None:
+                        chunk_queue.task_done()
                         break
+
+                    try:
+                        decrypted_chunk = cipher.update(chunk)
+                    finally:
+                        chunk_queue.task_done()
+
+                    f.write(decrypted_chunk)
+                    received_bytes += len(decrypted_chunk)
+                    pbar.update(len(decrypted_chunk))
+
+                    if network_stop.is_set() and chunk_queue.empty():
+                        break
+
+        reader_thread.join()
+
+        if network_error:
+            raise network_error[0]
         
         if received_bytes == file_size:
             safe_print(f"\n[OK] File saved to: {os.path.abspath(filepath)}")

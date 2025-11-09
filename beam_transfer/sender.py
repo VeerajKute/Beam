@@ -3,9 +3,11 @@ Sender module for initiating file transfers.
 """
 
 import os
+import queue
 import socket
 import struct
 import sys
+import threading
 from typing import Optional
 from beam_transfer.network import NetworkDiscovery, ConnectionHandler
 from beam_transfer.security import generate_transfer_key, get_key_hash, AESEncryptor, AESCTREncryptor
@@ -73,7 +75,11 @@ class FileSender:
             sock = ConnectionHandler.create_client_socket()
             try:
                 # Increase socket send buffer for higher throughput
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024)
+            except Exception:
+                pass
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except Exception:
                 pass
             sock.connect((receiver_ip, 25001))
@@ -104,26 +110,68 @@ class FileSender:
                 print(f"Sending file: {self.filename} ({self._format_size(self.file_size)})")
                 print("-" * 60)
                 
-                # Send file in chunks
+                # Send file in chunks with overlapped I/O
+                send_queue: "queue.Queue[Optional[tuple[bytes, memoryview]]]" = queue.Queue(maxsize=4)
+                send_exception: list[Exception] = []
+                network_stop = threading.Event()
+
+                def _network_sender() -> None:
+                    try:
+                        while True:
+                            item = send_queue.get()
+                            if item is None:
+                                send_queue.task_done()
+                                break
+
+                            chunk_header, chunk_view = item
+                            sock.sendall(chunk_header)
+                            sock.sendall(chunk_view)
+                            send_queue.task_done()
+                    except Exception as exc:
+                        send_exception.append(exc)
+                        network_stop.set()
+                        # Drain queue to unblock producer
+                        while True:
+                            try:
+                                item = send_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                            finally:
+                                send_queue.task_done()
+                    finally:
+                        network_stop.set()
+
+                network_thread = threading.Thread(target=_network_sender, daemon=True)
+                network_thread.start()
+
                 sent_bytes = 0
-                with open(self.filepath, 'rb') as f:
+                with open(self.filepath, 'rb', buffering=self.chunk_size) as f:
                     with tqdm(total=self.file_size, unit='B', unit_scale=True, desc="Uploading") as pbar:
                         while sent_bytes < self.file_size:
                             chunk = f.read(self.chunk_size)
                             if not chunk:
                                 break
-                            
+
                             # Encrypt chunk (streaming, no padding, no per-chunk IV)
                             encrypted_chunk = stream_cipher.update(chunk)
-                            
-                            # Send encrypted chunk with size prefix
+
+                            # Prepare chunk for async send
                             chunk_header = struct.pack('!I', len(encrypted_chunk))
-                            sock.sendall(chunk_header)
-                            # Use memoryview to avoid extra copies in Python
-                            sock.sendall(memoryview(encrypted_chunk))
-                            
+                            send_queue.put((chunk_header, memoryview(encrypted_chunk)))
+
                             sent_bytes += len(chunk)
                             pbar.update(len(chunk))
+
+                            if network_stop.is_set():
+                                break
+
+                if network_thread.is_alive():
+                    send_queue.put(None)
+                    send_queue.join()
+                network_thread.join()
+
+                if send_exception:
+                    raise send_exception[0]
                 
                 # Wait for final confirmation
                 # Finalize stream (CTR finalize returns empty, but call for completeness)
